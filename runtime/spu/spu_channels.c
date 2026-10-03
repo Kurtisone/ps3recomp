@@ -292,8 +292,34 @@ typedef struct spu_mfc_slot {
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
+/* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
+ * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
+ * "which SPU task never returned, and where is it" without a debugger. */
+static DWORD WINAPI spu_pcsample_thread(LPVOID p)
+{
+    const DWORD ms = (DWORD)(uintptr_t)p;
+    for (;;) {
+        Sleep(ms);
+        int i = 0;
+        AcquireSRWLockShared(&s_mfc_claim_lock);
+        for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next, i++) {
+            spu_context* c = slot->ctx;
+            if (c) fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
+                                   " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
+                           i, c->image_id, c->spu_id, (unsigned)(c->pc & SPU_LS_MASK),
+                           (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
+                           c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
+        }
+        ReleaseSRWLockShared(&s_mfc_claim_lock);
+        fflush(stderr);
+    }
+}
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    { static volatile LONG started = 0; const char* e;
+      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
+          CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
