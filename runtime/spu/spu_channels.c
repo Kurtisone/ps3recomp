@@ -198,6 +198,41 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+/* SPU_FLOAT_RZ=1 (opt-in, x86 with AVX2): SPU code runs with MXCSR at round toward zero +
+ * flush-to-zero + denormals-are-zero and g_spu_float_rz set, so the single-precision helpers take
+ * their native form (spu_helpers.h). Set on entry to spu_run_with_halt; the caller's MXCSR and
+ * flag are put back on the way out (normal return or halt). A run can happen synchronously on a
+ * PPU thread, whose own floating point must keep round to nearest with denormals. A nested run
+ * finds the mode already on and leaves it to the outer one. Returns 1 if it changed the mode. */
+static int spu_float_mode_enter(unsigned* outer)
+{
+#if defined(SPU_FLOAT_RZ_X86)
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && e[0] == '1' && !e[1];
+        __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
+    }
+    if (!on || g_spu_float_rz) return 0;
+    *outer = _mm_getcsr();
+    _mm_setcsr((*outer & ~SPU_MXCSR_RZ_FTZ_DAZ) | SPU_MXCSR_RZ_FTZ_DAZ);
+    g_spu_float_rz = 1;
+    return 1;
+#else
+    (void)outer;
+    return 0;
+#endif
+}
+static void spu_float_mode_leave(int changed, unsigned outer)
+{
+#if defined(SPU_FLOAT_RZ_X86)
+    if (changed) { g_spu_float_rz = 0; _mm_setcsr(outer); }
+#else
+    (void)changed; (void)outer;
+#endif
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -242,6 +277,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    unsigned fmode_outer = 0;
+    const int fmode = spu_float_mode_enter(&fmode_outer);   /* not modified after setjmp */
     switch (setjmp(s_spu_halt_env)) {
     case 1:
         halted = 1;
@@ -271,6 +308,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+    spu_float_mode_leave(fmode, fmode_outer);
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
