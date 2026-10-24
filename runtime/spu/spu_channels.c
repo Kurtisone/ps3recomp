@@ -203,7 +203,8 @@ void spu_stop(spu_context* ctx)
  * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
+ * the default around itself inside a run. arm64, and x86 with AVX2 + FMA (MXCSR, below);
+ * elsewhere the exact forms always run.
  * Returns the FPCR to restore, or ~0 when nothing was changed. */
 static uint64_t spu_float_mode_enter(void)
 {
@@ -221,6 +222,23 @@ static uint64_t spu_float_mode_enter(void)
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
+#elif defined(SPU_FLOAT_RZ_X86)
+    /* x86 (spu_helpers.h): MXCSR at round toward zero + FTZ + DAZ, the caller's exception masks
+     * kept, and g_spu_float_rz set with it. The caller's MXCSR is returned whatever it was
+     * (round to nearest or not, FTZ/DAZ or not) and put back exactly by the leave. A nested run
+     * finds the flag set and leaves both to the outer run. */
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && e[0] == '1' && !e[1];
+        __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
+    }
+    if (!on || g_spu_float_rz) return ~0ull;
+    const unsigned v = _mm_getcsr();
+    _mm_setcsr((v & ~0xE040u) | SPU_MXCSR_RZFZ_BITS);
+    g_spu_float_rz = 1;
+    return v;
 #else
     return ~0ull;
 #endif
@@ -229,6 +247,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif defined(SPU_FLOAT_RZ_X86)
+    if (outer != ~0ull) { g_spu_float_rz = 0; _mm_setcsr((unsigned)outer); }
 #else
     (void)outer;
 #endif

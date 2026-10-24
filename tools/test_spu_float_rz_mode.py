@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SPU_FLOAT_RZ: FPCR is round toward zero inside spu_run_with_halt and the caller's afterwards."""
 import os
+import platform
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,9 +14,11 @@ spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
            'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
            'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
+# x86: the MXCSR form needs AVX2 + FMA (spu_helpers.h); without them the fixture skips.
+isa = ['-mavx2', '-mfma'] if platform.machine().lower() in ('x86_64', 'amd64') else []
 with tempfile.TemporaryDirectory(prefix='spu-float-rz-mode-') as tmp:
     binary = Path(tmp) / 'test'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', *isa,
                     '-I'+str(root/'include'), '-I'+str(spu),
                     '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_float_rz_mode.c'),

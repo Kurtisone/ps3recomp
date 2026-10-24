@@ -201,6 +201,71 @@ static long dp_under_rz(long n)
     }
     return bad;
 }
+#elif defined(SPU_FLOAT_RZ_X86)
+/* x86 SPU_FLOAT_RZ: spu_float_mode_enter's MXCSR (round toward zero, FTZ, DAZ; exception masks as
+ * the default) with g_spu_float_rz set, and the default MXCSR with the flag clear. */
+#define MXCSR_RZ (0x1F80u | SPU_MXCSR_RZFZ_BITS)
+static void rz_on(void)  { _mm_setcsr(MXCSR_RZ); g_spu_float_rz = 1; }
+static void rz_off(void) { g_spu_float_rz = 0; _mm_setcsr(0x1F80u); }
+/* the mode must be as the op found it: MXCSR's control bits and the flag (bits 0-5 are the
+ * sticky exception flags, which ordinary arithmetic sets) */
+static long mode_kept(void) { return (_mm_getcsr() & ~0x3Fu) != MXCSR_RZ || g_spu_float_rz != 1; }
+/* Double precision, frds and the double compares give the default-MXCSR answer under the mode,
+ * and leave MXCSR and the flag as they found them. */
+static long dp_under_rz(long n)
+{
+    long bad = 0;
+    for (long it = 0; it < n; it++) {
+        u128 a, b, c;
+        for (int k = 0; k < 4; k++) {
+            a._u32[k] = rnd32(); b._u32[k] = rnd32(); c._u32[k] = rnd32();
+            if (it & 1) { a._u32[k & ~1] &= 0x800FFFFFu; }   /* denormal doubles */
+            if (it & 2) { b._u32[k & ~1] = (b._u32[k & ~1] & 0x800FFFFFu) | 0x3FF00000u; }
+        }
+        u128 want[12], got[12];
+        want[0] = spu_dfa(a, b); want[1] = spu_dfs(a, b); want[2] = spu_dfm(a, b);
+        want[3] = spu_dfma(a, b, c); want[4] = spu_dfms(a, b, c); want[5] = spu_dfnms(a, b, c);
+        want[6] = spu_dfnma(a, b, c); want[7] = spu_frds(a); want[8] = spu_dfceq(a, b);
+        want[9] = spu_dfcmeq(a, b); want[10] = spu_dfcgt(a, b); want[11] = spu_dfcmgt(a, b);
+        rz_on();
+        got[0] = spu_dfa(a, b); got[1] = spu_dfs(a, b); got[2] = spu_dfm(a, b);
+        got[3] = spu_dfma(a, b, c); got[4] = spu_dfms(a, b, c); got[5] = spu_dfnms(a, b, c);
+        got[6] = spu_dfnma(a, b, c); got[7] = spu_frds(a); got[8] = spu_dfceq(a, b);
+        got[9] = spu_dfcmeq(a, b); got[10] = spu_dfcgt(a, b); got[11] = spu_dfcmgt(a, b);
+        bad += mode_kept();
+        rz_off();
+        for (int k = 0; k < 12; k++) bad += memcmp(&want[k], &got[k], 16) != 0;
+    }
+    return bad;
+}
+/* The other helpers that compute with host floating point (conversions, estimates, compares,
+ * fesd, fscrrd) must not change answer under the mode: with DAZ and FTZ on, a host op that reads
+ * or makes a denormal would. Words from the pass-3 mix plus raw words. */
+static long other_under_rz(long n)
+{
+    long bad = 0;
+    for (long it = 0; it < n; it++) {
+        u128 a, b, c;
+        for (int k = 0; k < 4; k++) gen_lane((int)(rnd32() % 10), &a._u32[k], &b._u32[k], &c._u32[k]);
+        const int i8 = (int)(rnd32() % 256);
+        u128 want[13], got[13];
+#define OTHER_OPS(o) o[0] = spu_cflts(a, i8); o[1] = spu_cfltu(a, i8); o[2] = spu_csflt(a, i8); \
+        o[3] = spu_cuflt(a, i8); o[4] = spu_fceq(a, b); o[5] = spu_fcgt(a, b); o[6] = spu_fcmeq(a, b); \
+        o[7] = spu_fcmgt(a, b); o[8] = spu_fesd(a); o[9] = spu_fi(a, b); o[10] = spu_frest(a); \
+        o[11] = spu_frsqest(a); o[12] = spu_fscrrd(a);
+        OTHER_OPS(want)
+        rz_on();
+        OTHER_OPS(got)
+        bad += mode_kept();
+        rz_off();
+#undef OTHER_OPS
+        for (int k = 0; k < 13; k++)
+            if (memcmp(&want[k], &got[k], 16) && bad++ < 20)
+                printf("OTHER op %d under SPU_FLOAT_RZ: a=%08X %08X %08X %08X b=%08X i8=%d\n",
+                       k, a._u32[0], a._u32[1], a._u32[2], a._u32[3], b._u32[0], i8);
+    }
+    return bad;
+}
 #endif
 
 int main(int argc, char** argv)
@@ -216,6 +281,21 @@ int main(int argc, char** argv)
     const long dbad = dp_under_rz(4L * 1000 * 1000);
     printf("test_spu_float_exact: double precision under SPU_FLOAT_RZ: %ld mismatches\n", dbad);
     rc |= dbad != 0;
+#elif defined(SPU_FLOAT_RZ_X86)
+    /* The same passes with MXCSR at round toward zero + FTZ + DAZ and g_spu_float_rz set, where
+     * spu_fa.. take their native form and every other lane the integer lane forms. */
+    rz_on();
+    rc |= all_passes(scale, "x86 MXCSR round toward zero, FTZ, DAZ (SPU_FLOAT_RZ)");
+    const long kept = mode_kept();
+    rz_off();
+    printf("test_spu_float_exact: MXCSR and flag after the passes: %s\n", kept ? "CHANGED" : "kept");
+    rc |= kept != 0;
+    const long dbad = dp_under_rz(4L * 1000 * 1000);
+    printf("test_spu_float_exact: double precision under SPU_FLOAT_RZ: %ld mismatches\n", dbad);
+    rc |= dbad != 0;
+    const long obad = other_under_rz(4L * 1000 * 1000);
+    printf("test_spu_float_exact: conversions, estimates, compares under SPU_FLOAT_RZ: %ld mismatches\n", obad);
+    rc |= obad != 0;
 #endif
     return rc;
 }
